@@ -89,6 +89,24 @@ def main():
         "(contenedor (id gateway) (estado CrashLoopBackOff) (cpu-pct 40) (conexiones 8000))",
     ], "fuga-conexiones")
 
+    escenario("Autoescalado por demanda legitima", [
+        "(hpa (objetivo pago-movil-api) (escalando no) (replicas-actuales 2) (replicas-min 1) (replicas-max 10) (cpu-actual 92) (cpu-objetivo 70))",
+    ], "autoescalado-demanda")
+
+    # DDoS: misma saturacion de CPU que dispararia el HPA, pero el ataque
+    # debe BLOQUEAR el autoescalado (no aparece autoescalado-demanda).
+    env = correr([
+        "(ingress (servicio pago-movil-api) (requests-por-seg 9000) (tasa-4xx 70) (ips-distintas 3) (ataque si))",
+        "(hpa (objetivo pago-movil-api) (escalando no) (replicas-actuales 2) (replicas-min 1) (replicas-max 10) (cpu-actual 95) (cpu-objetivo 70))",
+    ])
+    tipos = [str(d["tipo"]) for d in diagnosticos(env)]
+    print("\n" + "=" * 60)
+    print("ESCENARIO: DDoS en el Ingress -> bloquea autoescalado")
+    print("=" * 60)
+    assert "ddos-bloqueo" in tipos, tipos
+    assert "autoescalado-demanda" not in tipos, f"el DDoS no bloqueo el escalado: {tipos}"
+    print("  [PASS] ddos-bloqueo (autoescalado bloqueado)")
+
     test_validacion_rango()
     print("\nTODOS LOS ESCENARIOS PASARON.")
 

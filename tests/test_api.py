@@ -40,6 +40,26 @@ def main():
     assert any(j["regla"] == "cascada-oom" for j in r.json()["justificaciones"])
     print("[PASS] GET /por-que")
 
+    # autoescalado por demanda legitima (HPA)
+    r = cli.post("/diagnosticar", json={
+        "hpas": [{"objetivo": "pago-movil-api", "escalando": "no", "replicas_actuales": 2,
+                  "replicas_min": 1, "replicas_max": 10, "cpu_actual": 92, "cpu_objetivo": 70}]
+    })
+    assert r.status_code == 200, r.text
+    assert "autoescalado-demanda" in [d["tipo"] for d in r.json()["diagnosticos"]]
+    print("[PASS] POST /diagnosticar -> autoescalado-demanda")
+
+    # DDoS en el Ingress bloquea el autoescalado
+    r = cli.post("/diagnosticar", json={
+        "ingress": [{"servicio": "pago-movil-api", "requests_por_seg": 9000, "tasa_4xx": 70, "ips_distintas": 3, "ataque": "si"}],
+        "hpas": [{"objetivo": "pago-movil-api", "escalando": "no", "replicas_actuales": 2,
+                  "replicas_min": 1, "replicas_max": 10, "cpu_actual": 95, "cpu_objetivo": 70}]
+    })
+    assert r.status_code == 200, r.text
+    tipos = [d["tipo"] for d in r.json()["diagnosticos"]]
+    assert "ddos-bloqueo" in tipos and "autoescalado-demanda" not in tipos, tipos
+    print("[PASS] POST /diagnosticar -> ddos-bloqueo (autoescalado bloqueado)")
+
     # validacion: cpu fuera de rango -> 422
     r = cli.post("/diagnosticar", json={
         "contenedores": [{"id": "mal", "estado": "Running", "cpu_pct": 150}]

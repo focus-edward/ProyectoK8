@@ -79,7 +79,10 @@ def construir_asserts(tele: dict[str, Any]) -> list[str]:
             "objetivo": h.get("objetivo"),
             "escalando": h.get("escalando"),
             "replicas-actuales": h.get("replicas_actuales"),
+            "replicas-min": h.get("replicas_min"),
             "replicas-max": h.get("replicas_max"),
+            "cpu-actual": h.get("cpu_actual"),
+            "cpu-objetivo": h.get("cpu_objetivo"),
         }))
 
     for v in tele.get("volumenes", []):
@@ -107,6 +110,15 @@ def construir_asserts(tele: dict[str, Any]) -> list[str]:
         asserts.append(_hecho("red", {
             "coredns-saturado": r.get("coredns_saturado"),
             "saturacion-pct": r.get("saturacion_pct"),
+        }))
+
+    for g in tele.get("ingress", []):
+        asserts.append(_hecho("ingress", {
+            "servicio": g.get("servicio"),
+            "requests-por-seg": g.get("requests_por_seg"),
+            "tasa-4xx": g.get("tasa_4xx"),
+            "ips-distintas": g.get("ips_distintas"),
+            "ataque": g.get("ataque"),
         }))
 
     return asserts

@@ -53,7 +53,12 @@
    (slot objetivo          (type SYMBOL))
    (slot escalando         (type SYMBOL) (allowed-symbols si no) (default no))
    (slot replicas-actuales (type INTEGER) (range 0 ?VARIABLE) (default 1))
-   (slot replicas-max      (type INTEGER) (range 0 ?VARIABLE) (default 1)))
+   (slot replicas-min      (type INTEGER) (range 1 ?VARIABLE) (default 1))
+   (slot replicas-max      (type INTEGER) (range 0 ?VARIABLE) (default 1))
+   ;; uso de CPU agregado del deployment vs el umbral objetivo del HPA:
+   ;; si cpu-actual supera cpu-objetivo, el HPA querra anadir replicas.
+   (slot cpu-actual        (type INTEGER) (range 0 100) (default 0))
+   (slot cpu-objetivo      (type INTEGER) (range 1 100) (default 70)))
 
 (deftemplate MAIN::volumen
    (slot id      (type SYMBOL))
@@ -78,6 +83,15 @@
    (slot coredns-saturado (type SYMBOL)  (allowed-symbols si no) (default no))
    (slot saturacion-pct   (type INTEGER) (range 0 100) (default 0)))
 
+;; Ingress Controller: punto de entrada del trafico al cluster. Aqui se
+;; mide la firma de un DDoS L7 (muchos req/s desde pocas IPs con 4xx alto).
+(deftemplate MAIN::ingress
+   (slot servicio         (type SYMBOL))
+   (slot requests-por-seg (type INTEGER) (range 0 ?VARIABLE) (default 0))
+   (slot tasa-4xx         (type INTEGER) (range 0 100) (default 0)) ; % de 4xx
+   (slot ips-distintas    (type INTEGER) (range 0 ?VARIABLE) (default 1))
+   (slot ataque           (type SYMBOL)  (allowed-symbols si no desconocido) (default desconocido)))
+
 
 ;;;----------------------------------------------------------
 ;;; SALIDA: DIAGNOSTICO Y JUSTIFICACION
@@ -90,7 +104,8 @@
    ;; 'tipo' es la llave interna: CORRELACION lo fija y MITIGACION
    ;; enruta los comandos por este simbolo (no por el string libre).
    (slot tipo       (type SYMBOL)
-                    (allowed-symbols indeterminado cpu-falsa-alarma cascada-oom fuga-conexiones)
+                    (allowed-symbols indeterminado cpu-falsa-alarma cascada-oom fuga-conexiones
+                                     autoescalado-demanda ddos-bloqueo)
                     (default indeterminado))
    (slot causa-raiz (type STRING))
    (slot severidad  (type SYMBOL) (allowed-symbols baja media alta critica) (default media))
@@ -220,10 +235,25 @@
    (bind ?obj  (leer-id      "Objetivo (deployment)"))
    (bind ?esc  (leer-simbolo "Escalando" si no))
    (bind ?ract (leer-rango   "Replicas actuales" 0 1000))
-   (bind ?rmax (leer-rango   "Replicas maximas"  0 1000))
+   (bind ?rmin (leer-rango   "Replicas minimas"  1 1000))
+   (bind ?rmax (leer-rango   "Replicas maximas"  1 1000))
+   (bind ?cpu  (leer-rango   "CPU actual del deployment (%)" 0 100))
+   (bind ?obj% (leer-rango   "CPU objetivo del HPA (%)" 1 100))
    (assert (hpa (objetivo ?obj) (escalando ?esc)
-                (replicas-actuales ?ract) (replicas-max ?rmax)))
+                (replicas-actuales ?ract) (replicas-min ?rmin) (replicas-max ?rmax)
+                (cpu-actual ?cpu) (cpu-objetivo ?obj%)))
    (printout t "   [ok] hpa de " ?obj " registrado." crlf))
+
+(deffunction MAIN::capturar-ingress ()
+   (printout t "--- Ingress (trafico entrante) ---" crlf)
+   (bind ?srv (leer-id      "Servicio detras del Ingress"))
+   (bind ?rps (leer-rango   "Requests por segundo" 0 10000000))
+   (bind ?e4  (leer-rango   "Tasa 4xx (%)" 0 100))
+   (bind ?ips (leer-rango   "IPs distintas observadas" 0 10000000))
+   (bind ?atk (leer-simbolo "Ataque marcado" si no desconocido))
+   (assert (ingress (servicio ?srv) (requests-por-seg ?rps) (tasa-4xx ?e4)
+                    (ips-distintas ?ips) (ataque ?atk)))
+   (printout t "   [ok] ingress de " ?srv " registrado." crlf))
 
 (deffunction MAIN::capturar-volumen ()
    (printout t "--- Volumen (PV/PVC) ---" crlf)
@@ -284,12 +314,13 @@
    (retract ?m)
    (printout t crlf
       "Capa a registrar:" crlf
-      "  1) Contenedor (Docker)   5) Volumen (PV/PVC)" crlf
-      "  2) Nodo (Kubernetes)     6) Control-plane"     crlf
-      "  3) Pod                   7) Trafico (servicio)" crlf
-      "  4) HPA (autoscaler)      8) Red / CoreDNS"      crlf
+      "  1) Contenedor (Docker)   6) Control-plane"      crlf
+      "  2) Nodo (Kubernetes)     7) Trafico (servicio)" crlf
+      "  3) Pod                   8) Red / CoreDNS"      crlf
+      "  4) HPA (autoscaler)      9) Ingress (DDoS)"     crlf
+      "  5) Volumen (PV/PVC)"                            crlf
       "  0) Terminar captura y diagnosticar"            crlf)
-   (bind ?op (leer-rango "Opcion" 0 8))
+   (bind ?op (leer-rango "Opcion" 0 9))
    (switch ?op
       (case 1 then (capturar-contenedor)    (assert (menu-captura)))
       (case 2 then (capturar-nodo)          (assert (menu-captura)))
@@ -299,6 +330,7 @@
       (case 6 then (capturar-control-plane) (assert (menu-captura)))
       (case 7 then (capturar-trafico)       (assert (menu-captura)))
       (case 8 then (capturar-red)           (assert (menu-captura)))
+      (case 9 then (capturar-ingress)       (assert (menu-captura)))
       (default (assert (captura-finalizada))
                (printout t crlf "Captura finalizada. Correlacionando..." crlf))))
 
@@ -416,6 +448,63 @@
 
 
 ;;;----------------------------------------------------------
+;;; HEURISTICA 4: DDoS EN EL INGRESS  -> BLOQUEAR AUTOESCALADO
+;;; (modificacion en vivo exigida por el enunciado)
+;;; Un pico de trafico puede parecer demanda legitima y disparar
+;;; el HPA. Pero si la firma es de DDoS L7 (muchos req/s desde muy
+;;; pocas IPs con 4xx alto), escalar solo gasta infraestructura
+;;; sirviendo trafico de ataque. Salience ALTA: corre antes que la
+;;; regla de autoescalado para bloquearla.
+;;;----------------------------------------------------------
+(defrule CORRELACION::ddos-bloquea-autoescalado
+   (declare (salience 85))
+   (ingress (servicio ?s) (requests-por-seg ?rps) (tasa-4xx ?e4)
+            (ips-distintas ?ips) (ataque ?atk))
+   (not (diagnostico (tipo ddos-bloqueo)))
+   (test (or (eq ?atk si)
+             (and (> ?rps 2000) (>= ?e4 40) (<= ?ips 10))))
+   =>
+   (assert (justificacion
+      (regla ddos-bloquea-autoescalado)
+      (premisa (str-cat "Ingress de " ?s ": ataque=" ?atk ", " ?rps " req/s desde "
+                        ?ips " IP(s) con " ?e4 "% de 4xx"))
+      (conclusion "Firma de DDoS L7: el pico NO es demanda legitima. Escalar gastaria infraestructura sirviendo trafico de ataque. Se BLOQUEA el autoescalado.")))
+   (assert (diagnostico
+      (tipo ddos-bloqueo)
+      (causa-raiz (str-cat "Ataque DDoS contra el Ingress de " ?s
+                           "; autoescalado bloqueado para evitar gasto masivo de infraestructura."))
+      (severidad alta))))
+
+
+;;;----------------------------------------------------------
+;;; HEURISTICA 5: AUTOESCALADO POR DEMANDA LEGITIMA
+;;; El HPA del servicio esta por debajo del maximo y la CPU agregada
+;;; supera el umbral objetivo. Si NO hay DDoS ni falsa alarma de CPU
+;;; (presion de nodo), la demanda es real: anadir replicas.
+;;;----------------------------------------------------------
+(defrule CORRELACION::autoescalado-demanda
+   (declare (salience 70))
+   (hpa (objetivo ?s) (replicas-actuales ?r) (replicas-max ?max)
+        (cpu-actual ?cpu) (cpu-objetivo ?obj))
+   (not (diagnostico (tipo ddos-bloqueo)))
+   (not (diagnostico (tipo cpu-falsa-alarma)))
+   (test (and (> ?cpu ?obj) (< ?r ?max)))
+   =>
+   (bind ?des (min ?max (max (+ ?r 1) (div (+ (* ?r ?cpu) ?obj -1) ?obj))))
+   (assert (justificacion
+      (regla autoescalado-demanda)
+      (premisa (str-cat "HPA de " ?s ": CPU " ?cpu "% supera el objetivo " ?obj
+                        "% con " ?r "/" ?max " replicas y sin presion de nodo ni DDoS"))
+      (conclusion (str-cat "Demanda legitima por encima de capacidad: el HPA debe escalar de "
+                           ?r " a " ?des " replicas."))))
+   (assert (diagnostico
+      (tipo autoescalado-demanda)
+      (causa-raiz (str-cat "Saturacion legitima de " ?s " (CPU " ?cpu "% > objetivo " ?obj
+                           "%): escalar de " ?r " a " ?des " replicas via HPA."))
+      (severidad media))))
+
+
+;;;----------------------------------------------------------
 ;;; FALLBACK: sin causa raiz concluyente
 ;;; Salience baja: solo se dispara si ninguna heuristica produjo
 ;;; un diagnostico. Evita "silencio" ante telemetria no cubierta.
@@ -496,6 +585,38 @@
       (str-cat "kubectl rollout restart deployment/" ?c "   # PALIATIVO: libera conexiones temporalmente")
       "# ACCION DE FONDO: corregir el cierre de conexiones/fds en el codigo (pool con leak)."
       "# Escalar o subir limites NO resuelve una fuga: solo retrasa el colapso.")))
+
+
+;;;----------------------------------------------------------
+;;; MITIGACION 4: DDoS -> NO escalar, contener en el Ingress
+;;; Rate-limit en el Ingress + congelar el HPA para que el ataque
+;;; no dispare gasto de infraestructura.
+;;;----------------------------------------------------------
+(defrule MITIGACION::mitigar-ddos-bloqueo
+   ?d <- (diagnostico (tipo ddos-bloqueo) (comandos))
+   (ingress (servicio ?s))
+   =>
+   (modify ?d (comandos
+      (str-cat "kubectl annotate ingress " ?s " nginx.ingress.kubernetes.io/limit-rps=\"20\" --overwrite   # rate-limit L7")
+      (str-cat "kubectl annotate ingress " ?s " nginx.ingress.kubernetes.io/limit-connections=\"10\" --overwrite")
+      (str-cat "kubectl patch hpa " ?s " --type=merge -p '{\"spec\":{\"maxReplicas\":1}}'   # congelar el autoescalado")
+      "# NO escalar el deployment: el pico es trafico de ataque, no demanda real.")))
+
+
+;;;----------------------------------------------------------
+;;; MITIGACION 5: autoescalado por demanda legitima
+;;; Subir el techo del HPA (o escalar) para absorber la demanda real.
+;;;----------------------------------------------------------
+(defrule MITIGACION::mitigar-autoescalado-demanda
+   ?d <- (diagnostico (tipo autoescalado-demanda) (comandos))
+   (hpa (objetivo ?s) (replicas-actuales ?r) (replicas-max ?max)
+        (cpu-actual ?cpu) (cpu-objetivo ?obj))
+   =>
+   (bind ?des (min ?max (max (+ ?r 1) (div (+ (* ?r ?cpu) ?obj -1) ?obj))))
+   (modify ?d (comandos
+      (str-cat "kubectl scale deployment/" ?s " --replicas=" ?des "   # " ?r " -> " ?des " (demanda legitima)")
+      (str-cat "kubectl get hpa " ?s " -w        # confirmar que el HPA converge")
+      (str-cat "kubectl get deployment/" ?s " -o wide   # verificar replicas listas"))))
 
 
 ;;;----------------------------------------------------------
