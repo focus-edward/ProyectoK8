@@ -22,6 +22,17 @@ body {
 header h1 { margin: 0; font-size: 28px; }
 header .sub { margin: 4px 0 0; color: var(--muted); }
 
+.tabs {
+  display: flex; gap: 8px; margin: 18px 0 4px; border-bottom: 1px solid var(--border);
+}
+.tab {
+  background: transparent; color: var(--muted); border: none;
+  border-bottom: 2px solid transparent; padding: 10px 16px; cursor: pointer;
+  font-size: 14px; font-weight: 600;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
 .presets {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   margin: 20px 0; color: var(--muted); font-size: 14px;

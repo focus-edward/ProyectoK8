@@ -2,10 +2,11 @@
 """API FastAPI sobre el motor CLIPS K8s-ExpertAdvisor.
 
 Endpoints:
-    POST /diagnosticar  -> recibe telemetria de las 3 capas, ejecuta el
-                           motor y devuelve diagnostico(s) + justificaciones.
-    GET  /por-que       -> arbol de deduccion del ultimo diagnostico.
-    GET  /salud         -> healthcheck (para Render).
+    POST /diagnosticar          -> telemetria de las 3 capas (sistema K8s).
+    GET  /por-que               -> arbol de deduccion del ultimo diagnostico K8s.
+    POST /pago-movil/diagnosticar -> pagos + config de autoescalado.
+    GET  /pago-movil/por-que    -> arbol de deduccion del ultimo diagnostico de pagos.
+    GET  /salud                 -> healthcheck (para Render).
 """
 from typing import Optional
 
@@ -14,6 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from motor import diagnosticar, ErrorTelemetria
+from motor_pagos import (
+    diagnosticar as diagnosticar_pagos,
+    ErrorTelemetria as ErrorTelemetriaPagos,
+)
 
 app = FastAPI(
     title="K8s-ExpertAdvisor",
@@ -32,6 +37,7 @@ app.add_middleware(
 
 # Cache del ultimo resultado para servir GET /por-que sin re-ejecutar.
 _ultimo: dict = {"diagnosticos": [], "justificaciones": []}
+_ultimo_pagos: dict = {"diagnosticos": [], "justificaciones": []}
 
 
 # ----- Modelos de telemetria (3 capas) -----
@@ -118,3 +124,57 @@ def post_diagnosticar(tele: Telemetria):
 @app.get("/por-que")
 def get_por_que():
     return {"justificaciones": _ultimo["justificaciones"]}
+
+
+# ----- Modelos de Pago Movil + Autoescalado -----
+class Pago(BaseModel):
+    id: str
+    telefono: str = ""
+    nombre: str = ""
+    tipo_documento: str = "V"
+    documento: str = ""
+    monto: float = 0.0
+
+
+class Servicio(BaseModel):
+    nombre: str = "pago-movil-svc"
+    replicas: int = 1
+    replicas_min: int = 1
+    replicas_max: int = 10
+    capacidad_por_replica: int = 50
+
+
+class Ventana(BaseModel):
+    tope: int = 100
+    carga_extra: int = 0  # pico simulado adicional en cola
+
+
+class Ingress(BaseModel):
+    servicio: str = "pago-movil-svc"
+    requests_por_seg: int = 0
+    tasa_4xx: int = 0
+    ips_distintas: int = 1
+    ataque: str = "desconocido"  # si | no | desconocido
+
+
+class EntradaPagos(BaseModel):
+    pagos: list[Pago] = Field(default_factory=list)
+    servicio: Servicio = Field(default_factory=Servicio)
+    ventana: Ventana = Field(default_factory=Ventana)
+    ingress: Ingress = Field(default_factory=Ingress)
+
+
+@app.post("/pago-movil/diagnosticar")
+def post_diagnosticar_pagos(entrada: EntradaPagos):
+    global _ultimo_pagos
+    try:
+        resultado = diagnosticar_pagos(entrada.model_dump())
+    except ErrorTelemetriaPagos as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _ultimo_pagos = resultado
+    return resultado
+
+
+@app.get("/pago-movil/por-que")
+def get_por_que_pagos():
+    return {"justificaciones": _ultimo_pagos["justificaciones"]}

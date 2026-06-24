@@ -21,3 +21,24 @@ export async function porQue() {
   if (!res.ok) throw new Error(`Error ${res.status}`)
   return res.json()
 }
+
+// --- Pago Movil + Autoescalado ---
+export async function diagnosticarPagos(entrada) {
+  const res = await fetch(`${BASE}/pago-movil/diagnosticar`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(entrada),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const detalle = data.detail || `Error ${res.status}`
+    throw new Error(typeof detalle === 'string' ? detalle : JSON.stringify(detalle))
+  }
+  return data
+}
+
+export async function porQuePagos() {
+  const res = await fetch(`${BASE}/pago-movil/por-que`)
+  if (!res.ok) throw new Error(`Error ${res.status}`)
+  return res.json()
+}

@@ -88,12 +88,7 @@ export default function App() {
   }
 
   return (
-    <div className="app">
-      <header>
-        <h1>K8s-ExpertAdvisor</h1>
-        <p className="sub">Sistema experto CLIPS · diagnóstico de causa raíz en Kubernetes</p>
-      </header>
-
+    <>
       <section className="presets">
         <span>Escenarios de ejemplo:</span>
         {Object.keys(PRESETS).map((n) => (
@@ -198,7 +193,7 @@ export default function App() {
           )}
         </div>
       </div>
-    </div>
+    </>
   )
 }
 
