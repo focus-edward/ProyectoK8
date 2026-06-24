@@ -8,6 +8,7 @@ const EST_NODO = ['Ready', 'NotReady']
 const PRESION = ['ninguna', 'DiskPressure', 'MemoryPressure', 'PIDPressure']
 const SI_NO = ['no', 'si']
 const ATAQUE = ['desconocido', 'no', 'si']
+const EST_VOL = ['Bound', 'Pending', 'Lost']
 
 // --- escenarios de demostracion: plataforma bancaria sobre Kubernetes ---
 // (un microservicio del banco por escenario, una heuristica del motor por cada uno)
@@ -52,6 +53,51 @@ const PRESETS = {
     traficos: [],
     red: { coredns_saturado: 'no', saturacion_pct: 0 },
   },
+  'DDoS por firma': {
+    // sin bandera "ataque": el motor lo detecta por la firma L7
+    // (muchos req/s desde muy pocas IPs con 4xx alto)
+    contenedores: [],
+    nodos: [],
+    hpas: [],
+    ingress: [{ servicio: 'core-bancario', requests_por_seg: 9000, tasa_4xx: 60, ips_distintas: 4, ataque: 'desconocido' }],
+    traficos: [],
+    red: { coredns_saturado: 'no', saturacion_pct: 0 },
+  },
+  'PVC lleno (ledger)': {
+    contenedores: [],
+    nodos: [],
+    hpas: [],
+    ingress: [],
+    traficos: [],
+    red: { coredns_saturado: 'no', saturacion_pct: 0 },
+    volumenes: [{ id: 'pvc-ledger', estado: 'Bound', uso_pct: 98 }],
+  },
+  'CoreDNS saturado': {
+    contenedores: [],
+    nodos: [],
+    hpas: [],
+    ingress: [],
+    traficos: [{ servicio: 'auth-service', latencia_p95: 900, latencia_p99: 3000, tasa_5xx: 4, tasa_4xx: 1 }],
+    red: { coredns_saturado: 'si', saturacion_pct: 88 },
+  },
+  'Control-plane saturado': {
+    contenedores: [],
+    nodos: [{ id: 'node-pagos-2', estado: 'Ready', presion: 'ninguna' }],
+    hpas: [],
+    ingress: [],
+    traficos: [],
+    red: { coredns_saturado: 'no', saturacion_pct: 0 },
+    control_plane: { saturado: 'si' },
+  },
+  'Crisis combinada': {
+    // multiples capas en crisis a la vez -> varios diagnosticos
+    contenedores: [{ id: 'pago-movil-api', estado: 'OOMKilled', cpu_pct: 70, mem_pct: 100, liveness: 'fallida', readiness: 'fallida', conexiones: 0 }],
+    nodos: [],
+    hpas: [{ objetivo: 'pago-movil-api', escalando: 'no', replicas_actuales: 2, replicas_min: 1, replicas_max: 10, cpu_actual: 95, cpu_objetivo: 70 }],
+    ingress: [{ servicio: 'pago-movil-api', requests_por_seg: 12000, tasa_4xx: 75, ips_distintas: 2, ataque: 'si' }],
+    traficos: [{ servicio: 'checkout', latencia_p95: 1500, latencia_p99: 5200, tasa_5xx: 35, tasa_4xx: 3 }],
+    red: { coredns_saturado: 'no', saturacion_pct: 20 },
+  },
 }
 
 const contenedorVacio = () => ({ id: '', estado: 'Running', cpu_pct: 0, mem_pct: 0, liveness: 'ok', readiness: 'ok', conexiones: 0 })
@@ -59,6 +105,7 @@ const nodoVacio = () => ({ id: '', estado: 'Ready', presion: 'ninguna' })
 const traficoVacio = () => ({ servicio: '', latencia_p95: 0, latencia_p99: 0, tasa_5xx: 0, tasa_4xx: 0 })
 const hpaVacio = () => ({ objetivo: '', escalando: 'no', replicas_actuales: 1, replicas_min: 1, replicas_max: 10, cpu_actual: 0, cpu_objetivo: 70 })
 const ingressVacio = () => ({ servicio: '', requests_por_seg: 0, tasa_4xx: 0, ips_distintas: 1, ataque: 'desconocido' })
+const volumenVacio = () => ({ id: '', estado: 'Bound', uso_pct: 0 })
 
 const SEV_COLOR = { critica: '#d92d20', alta: '#f59e0b', media: '#0093d0', baja: '#5a9216', indeterminado: '#6b7280' }
 
@@ -67,6 +114,8 @@ export default function App() {
   const [nodos, setNodos] = useState([])
   const [hpas, setHpas] = useState([])
   const [ingress, setIngress] = useState([])
+  const [volumenes, setVolumenes] = useState([])
+  const [controlPlane, setControlPlane] = useState({ saturado: 'no' })
   const [traficos, setTraficos] = useState(PRESETS['Cascada OOMKilled'].traficos.map((t) => ({ ...t })))
   const [red, setRed] = useState({ coredns_saturado: 'no', saturacion_pct: 10 })
 
@@ -81,6 +130,8 @@ export default function App() {
     setNodos(p.nodos.map((n) => ({ ...n })))
     setHpas(p.hpas.map((h) => ({ ...h })))
     setIngress(p.ingress.map((g) => ({ ...g })))
+    setVolumenes((p.volumenes || []).map((v) => ({ ...v })))
+    setControlPlane({ saturado: 'no', ...(p.control_plane || {}) })
     setTraficos(p.traficos.map((t) => ({ ...t })))
     setRed({ ...p.red })
     setResultado(null); setJustificaciones(null); setError(null)
@@ -93,7 +144,7 @@ export default function App() {
   async function onDiagnosticar() {
     setCargando(true); setError(null); setJustificaciones(null); setResultado(null)
     try {
-      const tele = { contenedores, nodos, hpas, ingress, traficos, red }
+      const tele = { contenedores, nodos, hpas, ingress, volumenes, traficos, red, control_plane: controlPlane }
       const data = await diagnosticar(tele)
       setResultado(data)
     } catch (e) {
@@ -200,11 +251,28 @@ export default function App() {
               ))}
             </Capa>
 
+            <Capa titulo="Volúmenes (PV/PVC)" onAdd={() => setVolumenes((p) => [...p, volumenVacio()])}>
+              {volumenes.map((v, i) => (
+                <Fila key={i} onDel={() => setVolumenes((p) => p.filter((_, j) => j !== i))}>
+                  <Txt label="id" value={v.id} onChange={(val) => editar(setVolumenes)(i, 'id', val)} />
+                  <Sel label="estado" value={v.estado} opts={EST_VOL} onChange={(val) => editar(setVolumenes)(i, 'estado', val)} />
+                  <Num label="uso %" value={v.uso_pct} onChange={(val) => editar(setVolumenes)(i, 'uso_pct', val)} />
+                </Fila>
+              ))}
+            </Capa>
+
             <div className="card">
               <h3>Red / CoreDNS</h3>
               <div className="fila">
                 <Sel label="CoreDNS saturado" value={red.coredns_saturado} opts={SI_NO} onChange={(v) => setRed({ ...red, coredns_saturado: v })} />
                 <Num label="saturación %" value={red.saturacion_pct} onChange={(v) => setRed({ ...red, saturacion_pct: v })} />
+              </div>
+            </div>
+
+            <div className="card">
+              <h3>Control-plane</h3>
+              <div className="fila">
+                <Sel label="API server saturado" value={controlPlane.saturado} opts={SI_NO} onChange={(v) => setControlPlane({ saturado: v })} />
               </div>
             </div>
 

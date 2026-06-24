@@ -107,6 +107,34 @@ def main():
     assert "autoescalado-demanda" not in tipos, f"el DDoS no bloqueo el escalado: {tipos}"
     print("  [PASS] ddos-bloqueo (autoescalado bloqueado)")
 
+    escenario("Almacenamiento: PV/PVC lleno", [
+        "(volumen (id pvc-ledger) (estado Bound) (uso-pct 98))",
+    ], "pvc-bloqueado")
+
+    escenario("Red: CoreDNS cuello de botella", [
+        "(red (coredns-saturado si) (saturacion-pct 88))",
+    ], "coredns-cuello")
+
+    escenario("Control-plane saturado", [
+        "(control-plane (saturado si))",
+    ], "control-plane-saturado")
+
+    # Crisis combinada: varias capas en crisis -> varios diagnosticos a la vez.
+    env = correr([
+        "(contenedor (id pago-movil-api) (estado OOMKilled) (mem-pct 100))",
+        "(trafico (servicio checkout) (tasa-5xx 35) (latencia-p99 5200))",
+        "(ingress (servicio pago-movil-api) (requests-por-seg 12000) (tasa-4xx 75) (ips-distintas 2) (ataque si))",
+        "(volumen (id pvc-ledger) (estado Bound) (uso-pct 98))",
+    ])
+    tipos = sorted(str(d["tipo"]) for d in diagnosticos(env))
+    print("\n" + "=" * 60)
+    print("ESCENARIO: Crisis combinada (multi-hallazgo)")
+    print("=" * 60)
+    print("  diagnosticos:", tipos)
+    for esperado in ("cascada-oom", "ddos-bloqueo", "pvc-bloqueado"):
+        assert esperado in tipos, f"falta {esperado} en {tipos}"
+    print("  [PASS] cascada-oom + ddos-bloqueo + pvc-bloqueado")
+
     test_validacion_rango()
     print("\nTODOS LOS ESCENARIOS PASARON.")
 

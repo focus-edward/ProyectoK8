@@ -105,7 +105,8 @@
    ;; enruta los comandos por este simbolo (no por el string libre).
    (slot tipo       (type SYMBOL)
                     (allowed-symbols indeterminado cpu-falsa-alarma cascada-oom fuga-conexiones
-                                     autoescalado-demanda ddos-bloqueo)
+                                     autoescalado-demanda ddos-bloqueo
+                                     pvc-bloqueado coredns-cuello control-plane-saturado)
                     (default indeterminado))
    (slot causa-raiz (type STRING))
    (slot severidad  (type SYMBOL) (allowed-symbols baja media alta critica) (default media))
@@ -505,6 +506,74 @@
 
 
 ;;;----------------------------------------------------------
+;;; HEURISTICA 6: ALMACENAMIENTO  -> PV/PVC bloqueado o lleno
+;;; Un volumen Lost/Pending (no liga) o casi lleno (>=95%) impide a
+;;; los pods persistir: en banca, el ledger/transacciones no escriben.
+;;; El sintoma puede verse como errores de la app, pero la causa raiz
+;;; es el almacenamiento.
+;;;----------------------------------------------------------
+(defrule CORRELACION::pvc-bloqueado
+   (declare (salience 80))
+   (volumen (id ?v) (estado ?e) (uso-pct ?u))
+   (not (diagnostico (tipo pvc-bloqueado)))
+   (test (or (eq ?e Lost) (eq ?e Pending) (>= ?u 95)))
+   =>
+   (assert (justificacion
+      (regla pvc-bloqueado)
+      (premisa (str-cat "Volumen " ?v " en estado " ?e " con uso " ?u "%"))
+      (conclusion "El PV/PVC no liga o esta lleno: los pods no pueden persistir datos. La causa raiz es el almacenamiento, no la aplicacion.")))
+   (assert (diagnostico
+      (tipo pvc-bloqueado)
+      (causa-raiz (str-cat "Almacenamiento bloqueado en el volumen " ?v " (estado " ?e
+                           ", uso " ?u "%): bloquea las escrituras del servicio."))
+      (severidad alta))))
+
+
+;;;----------------------------------------------------------
+;;; HEURISTICA 7: RED  -> CoreDNS como cuello de botella
+;;; Si CoreDNS esta saturado, la resolucion de nombres se degrada y
+;;; TODO el cluster sufre timeouts intermitentes. El sintoma aparece
+;;; como latencia/errores dispersos; la causa raiz es la red interna.
+;;;----------------------------------------------------------
+(defrule CORRELACION::coredns-cuello
+   (declare (salience 80))
+   (red (coredns-saturado ?d) (saturacion-pct ?s))
+   (not (diagnostico (tipo coredns-cuello)))
+   (test (or (eq ?d si) (>= ?s 80)))
+   =>
+   (assert (justificacion
+      (regla coredns-cuello)
+      (premisa (str-cat "Red: CoreDNS saturado=" ?d ", saturacion de red " ?s "%"))
+      (conclusion "CoreDNS saturado degrada la resolucion DNS de todo el cluster: causa timeouts intermitentes que parecen fallos de cada servicio.")))
+   (assert (diagnostico
+      (tipo coredns-cuello)
+      (causa-raiz (str-cat "Cuello de botella en CoreDNS (saturacion " ?s
+                           "%): la resolucion DNS degradada afecta a todos los servicios."))
+      (severidad media))))
+
+
+;;;----------------------------------------------------------
+;;; HEURISTICA 8: CONTROL PLANE saturado
+;;; Si el API server / control plane esta saturado, los comandos
+;;; kubectl y el scheduling se degradan: nada del cluster responde
+;;; bien. Es critico y precede a cualquier otra mitigacion.
+;;;----------------------------------------------------------
+(defrule CORRELACION::control-plane-saturado
+   (declare (salience 80))
+   (control-plane (saturado si))
+   (not (diagnostico (tipo control-plane-saturado)))
+   =>
+   (assert (justificacion
+      (regla control-plane-saturado)
+      (premisa "El control-plane (API server) esta marcado como saturado.")
+      (conclusion "Con el control plane saturado el scheduling y los kubectl se degradan: estabilizarlo es prioritario sobre cualquier otra accion.")))
+   (assert (diagnostico
+      (tipo control-plane-saturado)
+      (causa-raiz "Control plane saturado: el API server no procesa peticiones a tiempo; el cluster entero responde degradado.")
+      (severidad critica))))
+
+
+;;;----------------------------------------------------------
 ;;; FALLBACK: sin causa raiz concluyente
 ;;; Salience baja: solo se dispara si ninguna heuristica produjo
 ;;; un diagnostico. Evita "silencio" ante telemetria no cubierta.
@@ -617,6 +686,46 @@
       (str-cat "kubectl scale deployment/" ?s " --replicas=" ?des "   # " ?r " -> " ?des " (demanda legitima)")
       (str-cat "kubectl get hpa " ?s " -w        # confirmar que el HPA converge")
       (str-cat "kubectl get deployment/" ?s " -o wide   # verificar replicas listas"))))
+
+
+;;;----------------------------------------------------------
+;;; MITIGACION 6: PV/PVC bloqueado o lleno
+;;;----------------------------------------------------------
+(defrule MITIGACION::mitigar-pvc-bloqueado
+   ?d <- (diagnostico (tipo pvc-bloqueado) (comandos))
+   (volumen (id ?v))
+   =>
+   (modify ?d (comandos
+      (str-cat "kubectl describe pvc " ?v "   # ver evento de binding / llenado")
+      (str-cat "kubectl get pvc " ?v " -o wide   # estado, capacidad y storageclass")
+      (str-cat "kubectl patch pvc " ?v " -p '{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"20Gi\"}}}}'   # expandir si la storageclass lo permite")
+      "# Si esta Lost/Pending: revisar el aprovisionador y la storageclass; no reiniciar la app a ciegas.")))
+
+
+;;;----------------------------------------------------------
+;;; MITIGACION 7: CoreDNS cuello de botella
+;;;----------------------------------------------------------
+(defrule MITIGACION::mitigar-coredns-cuello
+   ?d <- (diagnostico (tipo coredns-cuello) (comandos))
+   =>
+   (modify ?d (comandos
+      "kubectl -n kube-system get deployment coredns -o wide   # replicas actuales"
+      "kubectl -n kube-system scale deployment/coredns --replicas=3   # ampliar CoreDNS"
+      "kubectl -n kube-system top pods -l k8s-app=kube-dns   # confirmar la carga"
+      "# Revisar ndots/autopath y cache de CoreDNS para bajar el volumen de consultas.")))
+
+
+;;;----------------------------------------------------------
+;;; MITIGACION 8: control plane saturado
+;;;----------------------------------------------------------
+(defrule MITIGACION::mitigar-control-plane-saturado
+   ?d <- (diagnostico (tipo control-plane-saturado) (comandos))
+   =>
+   (modify ?d (comandos
+      "kubectl get --raw=/readyz?verbose   # salud del API server"
+      "kubectl -n kube-system top pods -l component=kube-apiserver   # consumo del API server"
+      "kubectl get events -A --sort-by=.lastTimestamp | tail -20   # throttling / errores 429"
+      "# Reducir watchers/clientes agresivos y revisar la latencia de etcd antes de escalar nada.")))
 
 
 ;;;----------------------------------------------------------

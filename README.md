@@ -38,7 +38,7 @@ npm run dev
 ## Pruebas
 
 ```bash
-python tests/test_motor.py   # 5 escenarios heuristicos + validacion de entradas
+python tests/test_motor.py   # 9 escenarios heuristicos (incl. crisis combinada) + validacion
 python tests/test_api.py     # endpoints /diagnosticar, /por-que, /salud
 ```
 
@@ -51,8 +51,14 @@ python tests/test_api.py     # endpoints /diagnosticar, /por-que, /salud
 | `fuga-conexiones` | Conexiones altas + CPU baja + crashes | Bug de código (escalar no resuelve) |
 | `autoescalado-demanda` | HPA con CPU > objetivo y réplicas < máx, **sin DDoS** | Demanda legítima: escalar vía HPA |
 | `ddos-bloqueo` | Ingress con `ataque=si` o firma L7 (req/s altos, 4xx≥40%, pocas IPs) | DDoS: **bloquear autoescalado**, rate-limit + congelar HPA |
+| `pvc-bloqueado` | Volumen Lost/Pending o uso≥95% | Almacenamiento bloquea escrituras (no la app) |
+| `coredns-cuello` | CoreDNS saturado o red ≥80% | Resolución DNS degradada afecta a todo el clúster |
+| `control-plane-saturado` | API server saturado | Scheduling/kubectl degradados (prioridad crítica) |
 
-Las dos últimas implementan la **autoescalado + "modificación en vivo"** del enunciado:
+Como las reglas son independientes, una **crisis combinada** puede emitir varios diagnósticos
+a la vez (p. ej. `cascada-oom` + `ddos-bloqueo` + `pvc-bloqueado`).
+
+Las reglas de autoescalado y DDoS implementan la **autoescalado + "modificación en vivo"** del enunciado:
 ante un DDoS en el Ingress el motor **frena el escalado** para no gastar infraestructura
 sirviendo tráfico de ataque (la regla `ddos-bloquea-autoescalado` tiene salience mayor y
 guarda la regla de autoescalado).
